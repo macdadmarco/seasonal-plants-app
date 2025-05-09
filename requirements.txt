@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-openai-agents
+openai
 requests
 python-dotenv
 wikipedia

@@ -1,27 +1,30 @@
 from fastapi import FastAPI, Query
-from openai_agents import Agent, Tool, OpenAI
 from datetime import date, datetime
 from dotenv import load_dotenv
 import os
 import requests
 import wikipedia
+import openai
 
+# Load API keys from .env
 load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 app = FastAPI()
-openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def region_to_season(region: str, query_date: str) -> str:
+# --- Tool 1: Region to Climate Zone and Season ---
+def region_to_season(region: str, query_date: str) -> dict:
     geocode_url = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {
         "address": region,
-        "key": os.getenv("GOOGLE_API_KEY")
+        "key": GOOGLE_API_KEY
     }
     response = requests.get(geocode_url, params=params)
     response.raise_for_status()
     results = response.json()["results"]
     if not results:
-        return "Unknown region"
+        return {"climate": "Unknown", "season": "Unknown"}
 
     location = results[0]["geometry"]["location"]
     lat = location["lat"]
@@ -34,82 +37,47 @@ def region_to_season(region: str, query_date: str) -> str:
         climate = "Polar"
 
     hemisphere = "Northern" if lat >= 0 else "Southern"
-
     dt = datetime.fromisoformat(query_date)
     month = dt.month
 
     if hemisphere == "Northern":
-        if 3 <= month <= 5:
-            season = "Spring"
-        elif 6 <= month <= 8:
-            season = "Summer"
-        elif 9 <= month <= 11:
-            season = "Fall"
-        else:
-            season = "Winter"
+        season = (
+            "Spring" if 3 <= month <= 5 else
+            "Summer" if 6 <= month <= 8 else
+            "Fall" if 9 <= month <= 11 else
+            "Winter"
+        )
     else:
-        if 3 <= month <= 5:
-            season = "Fall"
-        elif 6 <= month <= 8:
-            season = "Winter"
-        elif 9 <= month <= 11:
-            season = "Spring"
-        else:
-            season = "Summer"
+        season = (
+            "Fall" if 3 <= month <= 5 else
+            "Winter" if 6 <= month <= 8 else
+            "Spring" if 9 <= month <= 11 else
+            "Summer"
+        )
 
-    return f"{climate} zone, {season}"
+    return {"climate": climate, "season": season}
 
-region_mapper = Tool(
-    name="region_mapper",
-    func=region_to_season,
-    description="Given a region string and date, returns the climate zone and current season."
-)
-
-def get_edible_plants(climate_zone: str, season: str) -> list:
+# --- Tool 2: Get Plants Based on Zone/Season ---
+def get_edible_plants(climate: str, season: str) -> list:
     plants = {
         ("Temperate", "Spring"): [
-            {"name": "Urtica dioica", "common": "Stinging Nettle"},
-            {"name": "Allium tricoccum", "common": "Wild Leek"},
-            {"name": "Taraxacum officinale", "common": "Dandelion"},
-            {"name": "Asparagus officinalis", "common": "Wild Asparagus"},
-            {"name": "Viola odorata", "common": "Sweet Violet"},
+            "Stinging Nettle", "Wild Leek", "Dandelion",
+            "Wild Asparagus", "Sweet Violet"
         ],
         ("Tropical", "Spring"): [
-            {"name": "Moringa oleifera", "common": "Drumstick Tree"},
-            {"name": "Amaranthus spp.", "common": "Amaranth Greens"},
-            {"name": "Colocasia esculenta", "common": "Taro"},
-            {"name": "Manihot esculenta", "common": "Cassava"},
-            {"name": "Basella alba", "common": "Malabar Spinach"},
+            "Drumstick Tree", "Amaranth Greens", "Taro",
+            "Cassava", "Malabar Spinach"
         ]
     }
-    return plants.get((climate_zone, season), [])
+    return plants.get((climate, season), [])
 
-plant_finder = Tool(
-    name="plant_finder",
-    func=get_edible_plants,
-    description="Given a climate zone and season, returns a list of edible plants in season."
-)
-
-SYSTEM_PROMPT = """
-You are a foraging assistant. When given a region and a date, you must:
-1. Call the 'region_mapper' tool to get climate zone & season.
-2. Call the 'plant_finder' tool with the zone and season.
-3. Return a JSON array of the plants: [{name, common_name}...].
-"""
-
-agent = Agent(
-    name="ForagingAgent",
-    tools=[region_mapper, plant_finder],
-    llm=openai.chat.completions,
-    system_message=SYSTEM_PROMPT,
-)
-
+# --- Tool 3: Enrich Plant Info ---
 def enrich_plant_info(common_name: str) -> dict:
     try:
         summary = wikipedia.summary(common_name, sentences=2)
         page = wikipedia.page(common_name)
         image_url = page.images[0] if page.images else ""
-        recipe_link = f"https://www.google.com/search?q={common_name}+recipe"
+        recipe_link = f"https://www.google.com/search?q={common_name.replace(' ', '+')}+recipe"
         return {
             "name": common_name,
             "description": summary,
@@ -124,17 +92,20 @@ def enrich_plant_info(common_name: str) -> dict:
             "recipe_link": ""
         }
 
+# --- Endpoint ---
 @app.get("/plants/")
-async def list_plants(region: str = Query(..., example="Pacific Northwest, USA")):
+async def list_plants(region: str = Query(..., example="Pacific Northwest")):
     today = date.today().isoformat()
-    response = await agent.run({
+    zone = region_to_season(region, today)
+    climate = zone["climate"]
+    season = zone["season"]
+
+    plant_names = get_edible_plants(climate, season)
+    enriched = [enrich_plant_info(name) for name in plant_names]
+
+    return {
         "region": region,
-        "date": today
-    })
-
-    enriched_plants = []
-    for plant in response:
-        enriched = enrich_plant_info(plant.get("common", plant.get("name")))
-        enriched_plants.append(enriched)
-
-    return enriched_plants
+        "climate_zone": climate,
+        "season": season,
+        "plants": enriched
+    }
